@@ -1,0 +1,743 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+
+const core = @import("core");
+const static = core.static;
+const zengine = @import("zengine");
+const Zengine = zengine.Zengine;
+const allocators = zengine.allocators;
+const c = zengine.ext;
+const ecs = zengine.ecs;
+const Event = zengine.Event;
+const gfx = zengine.gfx;
+const Scene = zengine.gfx.Scene;
+const global = zengine.global;
+const math = zengine.math;
+const perf = zengine.perf;
+const sched = zengine.sched;
+const time = zengine.time;
+const Engine = zengine.Engine;
+const ui = zengine.ui;
+const str = zengine.str;
+const RunCounter = time.Counter;
+
+const Assets = @import("Assets.zig");
+const game_render = @import("render.zig");
+const PostFXPass = @import("PostFXPass.zig");
+
+const log = std.log.scoped(.main);
+
+// pub const arch_options: core.Options = .{
+//     // .output_symbol_table = true,
+//     .random_seed = false,
+//     .allow_level_skip = true,
+// };
+//
+pub const zengine_options: zengine.Options = .{
+    .core = .{
+        .app_identifier = "arch",
+        .log_allocations = false,
+    },
+    .has_debug_ui = false,
+    .gfx = .{
+        .wanted_swapchain_composition = .SDR,
+        .create_textures = false,
+    },
+};
+
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .log_scope_levels = &.{
+        // .{ .scope = .gfx_renderer, .level = .debug },
+        // .{ .scope = .gfx_render, .level = .debug },
+        .{ .scope = .audio, .level = .info },
+        .{ .scope = .core, .level = .info },
+        .{ .scope = .cp437, .level = .info },
+        .{ .scope = .game, .level = .info },
+        .{ .scope = .int, .level = .info },
+        .{ .scope = .main, .level = .info },
+        .{ .scope = .platform, .level = .info },
+        .{ .scope = .param, .level = .info },
+        .{ .scope = .prng, .level = .info },
+        .{ .scope = .read, .level = .info },
+        .{ .scope = .scratch, .level = .info },
+        .{ .scope = .static, .level = .info },
+        .{ .scope = .txt, .level = .info },
+        .{ .scope = .unit, .level = .info },
+    },
+    .logFn = logFn,
+};
+
+const RenderPasses = struct {
+    scale: gfx.pass.Blend = .{
+        .load_op = .clear,
+    },
+    postfx: PostFXPass = undefined,
+    letterbox: gfx.pass.Letterbox = undefined,
+    render: gfx.pass.Render = .{
+        .exposure = 1,
+        .gamma = 1,
+        .config = .{
+            .has_agx = false,
+            .has_lut = false,
+            .has_srgb = false,
+        },
+    },
+};
+
+const lut_key = "lut/basic.cube";
+const font_key = "fonts/Ac437_IBM_VGA_9x16.ttf";
+
+var gfx_loader: gfx.Loader = undefined;
+var gfx_passes: RenderPasses = .{};
+var gfx_fence: gfx.GPUFence = .invalid;
+
+var allocs_window: zengine.ui.AllocsWindow = undefined;
+var perf_window: zengine.ui.PerfWindow = undefined;
+var log_window: zengine.ui.LogWindow = .invalid;
+
+var settings_path: []const u8 = undefined;
+var state: State = undefined;
+
+const MainCtx = struct {
+    self: *const Zengine,
+    arenas: *sched.WorkerArena.Array,
+};
+const WorkerCtx = struct {
+    arenas: *sched.WorkerArena.Array,
+};
+
+const State = struct {
+    assets: Assets,
+    // game: core.state.GameState,
+    // frame: core.state.Frame,
+    run_counter: RunCounter = .init(1),
+    rnd: std.Random.DefaultPrng,
+    active_music: ?[]const u8 = null,
+    input_idx: usize = 0,
+
+    fn init(win_size: core.game.Point.U) !@This() {
+        return .{
+            .assets = try .init(allocators.global()),
+            .game = try .init(allocators.gpa(), win_size),
+            .frame = try .init(allocators.gpa(), win_size),
+            .rnd = .init(0),
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.game.deinit(allocators.gpa());
+        self.frame.deinit(allocators.gpa());
+    }
+
+    pub fn tick(self: *@This()) !bool {
+        self.run_counter.add(1);
+        while (self.run_counter.run()) {
+            const to = try core.update(&self.game);
+            state.game.input_buf[0] = .none;
+            state.input_idx = 0;
+
+            try core.render(&self.game, &self.frame);
+            self.run_counter.interval = core.sleep(&self.game);
+            switch (try core.transfer(&self.game, to)) {
+                .end => return false,
+                else => {},
+            }
+        }
+        return true;
+    }
+};
+
+fn logFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const level_txt = comptime message_level.asText();
+    const prefix2 = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    log_window.print(level_txt ++ prefix2 ++ format ++ "\n", args) catch |err| {
+        std.log.defaultLog(.err, .default, "failed printing to log window: {t}", .{err});
+    };
+    std.log.defaultLog(message_level, scope, format, args);
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    allocators.init(1 << 30);
+    defer allocators.deinit();
+
+    log_window = try .init(allocators.gpa());
+    defer log_window.deinit();
+
+    // log_window = try .init(allocators.gpa());
+    // defer log_window.deinit();
+
+    var engine = try Zengine.create(.{
+        // .register = &register,
+        .load = &load,
+        .unload = &unload,
+        .run = &run,
+    }, &.{
+        .title = "Arch",
+        .size = .{ 1920, 1080 },
+        .flags = .initMany(&.{
+            .high_pixel_density,
+            .resizable,
+        }),
+    }, init);
+    defer engine.deinit();
+
+    const args = global.args();
+    if (args.len > 1) return error.TooManyArguments;
+
+    return engine.run();
+}
+
+fn load(self: *const Zengine) !bool {
+    const sizes = try game_render.createTextures(self.renderer);
+    gfx_passes.postfx = .{ .size = sizes.tex_size };
+    gfx_passes.letterbox = .{
+        .scale = gfx.pass.Letterbox.calculateScale(sizes.tex_size, sizes.win_size),
+    };
+
+    gfx_loader = try .init(self.renderer);
+    errdefer gfx_loader.deinit();
+    {
+        errdefer gfx_loader.cancel();
+        try gfx_loader.createGraphicsPipelines();
+        try game_render.createGamePipeline(&gfx_loader);
+
+        const main_win = self.engine.windows.getPtr("main");
+        _ = try gfx_loader.loadLut(lut_key);
+        const font = try gfx_loader.loadFont(font_key, 32);
+        _ = try gfx_loader.createSurfaceTexture(
+            "messages_buffer",
+            main_win.logicalSize(),
+            .default,
+        );
+
+        const frame_buffer = try gfx_loader.renderer.getOrCreateStorageBuffer("frame_buffer");
+        {
+            const gpa = gfx_loader.renderer.allocator;
+            try frame_buffer.ensureUnusedCapacity(
+                gpa,
+                .vertex,
+                [2]math.Vector4,
+                game_render.cells[0] * game_render.cells[1],
+            );
+            const w0 = 100;
+            const h0 = 0;
+            const ctr = 12;
+            const w = game_render.cells[0] - 1;
+            const h = game_render.cells[1] - 1;
+            for (0..game_render.cells[1]) |y| {
+                for (0..game_render.cells[0]) |x| {
+                    const dir: usize = switch (x) {
+                        w0 => switch (y) {
+                            h0 => 2 | 4,
+                            ctr => 1 | 2 | 4,
+                            h => 1 | 2,
+                            else => 1 | 4,
+                        },
+                        w => switch (y) {
+                            h0 => 4 | 8,
+                            ctr => 1 | 4 | 8,
+                            h => 1 | 8,
+                            else => 1 | 4,
+                        },
+                        w0 + 1...w - 1 => switch (y) {
+                            h0 => 2 | 8,
+                            ctr => 2 | 8,
+                            h => 2 | 8,
+                            h0 + 1...ctr - 1 => 15,
+                            else => 0,
+                        },
+                        else => 0,
+                    };
+                    frame_buffer.appendAssumeCapacity(
+                        .vertex,
+                        [2]math.Vector4,
+                        0,
+                        &.{
+                            .{ 0, 0, 0, static.sym.dbl_walls[dir] },
+                            .{ 1, 1, 1, 0 },
+                        },
+                    );
+                }
+            }
+            try gfx_loader.flagModified(.storage_buffer, "frame_buffer");
+        }
+
+        const frame_size = game_render.frame_size;
+        const frame_tex = try gfx_loader.createSurfaceTexture("frame_buffer", frame_size, .default);
+        {
+            const surf = frame_tex.surf;
+            const scr = surf.slice(u32);
+            assert(surf.width() * surf.height() == frame_size[0] * frame_size[1]);
+            for (0..frame_size[1]) |y| {
+                for (0..frame_size[0]) |x| {
+                    const w = frame_size[0] - 1;
+                    const h = frame_size[1] - 1;
+                    const is_g = x == 0 and y == 0 or x == w and y == 0 or
+                        x == 0 and y == h or x == w and y == h;
+                    scr[y * frame_size[0] + x] = surf.rgba(.{
+                        @intCast(255 * x / frame_size[0]),
+                        if (is_g) 255 else 0,
+                        @intCast(128 * y / frame_size[1]),
+                        1,
+                    });
+                }
+            }
+        }
+
+        const minimap_tex = try gfx_loader.createSurfaceTexture(
+            "minimap",
+            game_render.minimap_frame_size,
+            .default,
+        );
+        {
+            const size = game_render.minimap_frame_size;
+            const surf = minimap_tex.surf;
+            const scr = surf.slice(u32);
+            for (0..size[1]) |y| {
+                for (0..size[0]) |x| {
+                    const xa: f32 = @floatFromInt(x);
+                    const ya: f32 = @floatFromInt(y);
+                    scr[y * size[0] + x] = surf.rgba(.{
+                        @intFromFloat(xa / size[0] * 255),
+                        @intFromFloat(ya / size[1] * 255),
+                        0,
+                        255,
+                    });
+                }
+            }
+        }
+
+        const font_atlas = try gfx_loader.createSurfaceTexture(
+            "font_atlas",
+            game_render.font_atlas_size,
+            .default,
+        );
+        for (0..256) |ch| {
+            const codepoint = core.cp437.resolveUnicode(@intCast(ch));
+            var surf = try font.renderGlyph(codepoint, .{ 255, 255, 255, 255 });
+            defer surf.deinit();
+            const x: i32 = @intCast(ch % 16);
+            const y: i32 = @intCast(ch / 16);
+            try font_atlas.surf.blitScaled(&.{
+                x * @as(i32, @intCast(game_render.ch_size[0])),
+                y * @as(i32, @intCast(game_render.ch_size[1])),
+                @as(i32, @intCast(game_render.ch_size[0])),
+                @as(i32, @intCast(game_render.ch_size[1])),
+            }, surf, &.{ 0, 0, @intCast(surf.width()), @intCast(surf.height()) }, .pixelart);
+        }
+        gfx_fence = try gfx_loader.commit();
+    }
+
+    Zengine.sections.sub(.load).sub(.ui).begin();
+
+    allocs_window = .init();
+    perf_window = .init(allocators.global());
+
+    Zengine.sections.sub(.load).sub(.ui).end();
+    allocators.scratchRelease();
+
+    // state = try .init(.{ .x = game_render.cells[0], .y = game_render.cells[1] });
+    // try readSettings(&state.game.ui.settings);
+    // try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.samples, static.asset.sample.activate),
+    //     .oneshot,
+    // );
+    // try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.samples, static.asset.sample.explosion),
+    //     .oneshot,
+    // );
+    // try loadSound(self, try state.assets.assetPath(.samples, static.asset.sample.woosh), .oneshot);
+    // try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.samples, static.asset.sample.engine_idle),
+    //     .movement,
+    // );
+    // try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.samples, static.asset.sample.engine_x),
+    //     .movement,
+    // );
+    // try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.samples, static.asset.sample.engine_y),
+    //     .movement,
+    // );
+    //
+    // for (&static.asset.music.levels) |level| try loadSound(
+    //     self,
+    //     try state.assets.assetPath(.music, level),
+    //     .music,
+    // );
+    // try loadSound(self, try state.assets.assetPath(.music, static.asset.music.menu), .music);
+
+    try reset();
+    // try Message.add("Press space to start...");
+
+    return true;
+}
+
+fn loadSound(
+    self: *const Zengine,
+    path: [:0]const u8,
+    config: enum { oneshot, movement, music },
+) !void {
+    var audio = try zengine.audio.loader.loadFile(&.{
+        .allocator = allocators.gpa(),
+        .mixer = self.audio.mixer,
+        .file_path = path,
+    });
+    errdefer audio.deinit();
+    var track = try zengine.audio.Track.init(self.audio.mixer);
+    errdefer track.deinit();
+    assert(audio.isValid());
+    assert(track.isValid());
+    switch (config) {
+        .oneshot => {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[2])) / 10.0;
+            try track.setGain(gain);
+        },
+        .movement => {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[3])) / 10.0;
+            try track.setGain(gain);
+            try track.setLooping(true);
+            // try track.setFadeIn(cathode_run_options.movement_fade_in_ms);
+            // try track.setFadeOut(cathode_run_options.movement_fade_out_ms);
+        },
+        .music => {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[4])) / 10.0;
+            try track.setGain(gain);
+            try track.setLooping(true);
+            // try track.setFadeIn(cathode_run_options.music_fade_in_ms);
+            // try track.setFadeOut(cathode_run_options.music_fade_in_ms);
+        },
+    }
+    try track.setAudio(audio);
+    try self.audio.audios.insert(self.audio.allocator, path, audio);
+    try self.audio.tracks.insert(self.audio.allocator, path, track);
+}
+
+fn reset() !void {}
+
+fn unload(self: *const Zengine) !void {
+    // state.deinit();
+    if (gfx_fence.isValid()) {
+        self.renderer.gpu_device.wait(.any, &.{gfx_fence}) catch unreachable;
+        self.renderer.gpu_device.release(&gfx_fence);
+    }
+    allocs_window.deinit(allocators.ui());
+    perf_window.deinit();
+    gfx_loader.deinit();
+}
+
+fn run(self: *const Zengine) !void {
+    const arenas = try sched.WorkerArena.createArray(allocators.gpa());
+    defer sched.WorkerArena.deinitArray(arenas);
+    inline for (arenas, 0..) |*arena, n| try allocs_window.appendArena(
+        allocators.ui(),
+        std.fmt.comptimePrint("thread {}", .{n}),
+        &arena.inner,
+    );
+
+    var thread_pool = try sched.ThreadPool(&.{
+        .{
+            .ctx = MainCtx,
+            .len = .one,
+            .priority = .main,
+        },
+        .{
+            .ctx = WorkerCtx,
+            .len = .remaining,
+        },
+    }, .{ spawnMain, spawnWorker }).create();
+    defer thread_pool.deinit();
+    try thread_pool.run(.{
+        .{
+            .self = self,
+            .arenas = arenas,
+        },
+        .{
+            .arenas = arenas,
+        },
+    });
+    thread_pool.join();
+}
+
+fn spawnMain(
+    ctx: MainCtx,
+    info: *const sched.ThreadInfo,
+    global_state: *sched.ThreadInfo.GroupSharedState,
+) !bool {
+    _ = info;
+    defer global_state.barrier.sync(.yield);
+    defer perf.reset();
+    const section = Zengine.sections.sub(.frame);
+    Zengine.main_section.push();
+    section.begin();
+
+    section.sub(.init).begin();
+    global.startFrame();
+    defer global.finishFrame();
+    defer allocators.frameReset();
+    const now = global.engineNow();
+    perf.update(now);
+    perf.updateStats(now, false);
+    section.sub(.init).end();
+
+    {
+        section.sub(.input).begin();
+        defer section.sub(.input).end();
+        if (!try input(ctx.self)) return false;
+    }
+
+    {
+        section.sub(.update).begin();
+        defer section.sub(.update).end();
+        if (ctx.self.engine.state.resized) {
+            @branchHint(.unlikely);
+            if (!try resize(ctx.self)) return false;
+            ctx.self.engine.state.resized = false;
+        }
+
+        // if (!try update(self)) return;
+    }
+
+    section.sub(.render).begin();
+    try render(ctx.self);
+    section.sub(.render).end();
+
+    if (global.isFirstFrame()) {
+        @branchHint(.cold);
+        Zengine.main_section.end();
+        perf.updateStats(0, true);
+    }
+
+    section.end();
+    Zengine.main_section.pop();
+    return true;
+}
+
+fn spawnWorker(
+    ctx: WorkerCtx,
+    info: *const sched.ThreadInfo,
+    global_state: *sched.ThreadInfo.GroupSharedState,
+) !bool {
+    defer global_state.barrier.sync(.yield);
+    _ = ctx;
+    _ = info;
+    return true;
+}
+
+fn input(self: *const Zengine) !bool {
+    while (Event.poll(self.engine)) |event| {
+        if (self.ui.show_ui) log.debug("ui event", .{});
+        if (self.ui.show_ui and c.ImGui_ImplSDL3_ProcessEvent(&event.sdl)) {
+            log.debug("ui event not", .{});
+            switch (event.type) {
+                .quit => return false,
+                .key_down => {
+                    if (event.sdl.key.repeat) break;
+                    switch (event.sdl.key.key) {
+                        c.SDLK_F1 => self.ui.show_ui = !self.ui.show_ui,
+                        c.SDLK_ESCAPE => self.ui.show_ui = !self.ui.show_ui,
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+            continue;
+        }
+
+        switch (event.type) {
+            .quit => return false,
+            .key_down => {
+                if (event.sdl.key.repeat) break;
+                switch (event.sdl.key.key) {
+                    c.SDLK_F1 => self.ui.show_ui = !self.ui.show_ui,
+                    c.SDLK_F10 => try reset(),
+                    c.SDLK_ESCAPE => return false,
+                    else => {},
+                }
+            },
+            .key_up => switch (event.sdl.key.key) {
+                else => {},
+            },
+            else => {},
+        }
+    }
+    // state.game.input_buf[state.input_idx] = .none;
+    return true;
+}
+
+fn resize(self: *const Zengine) !bool {
+    if (gfx_fence.isValid()) {
+        try self.renderer.gpu_device.wait(.any, &.{gfx_fence});
+        self.renderer.gpu_device.release(&gfx_fence);
+    }
+    const sizes = try game_render.resizeTextures(self.renderer);
+    gfx_passes.postfx = .{ .size = sizes.tex_size };
+    gfx_passes.letterbox = .{
+        .scale = gfx.pass.Letterbox.calculateScale(sizes.tex_size, sizes.win_size),
+    };
+    return true;
+}
+
+fn update(self: *const Zengine) !bool {
+    if (!try state.tick()) return false;
+    if (core.int.flag.has(state.game.ui.state, core.state.UIState.one(.update_settings))) {
+        core.int.flag.clr(&state.game.ui.state, core.state.UIState.one(.update_settings));
+        try updateSettings(&state.game.ui.settings);
+        {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[2])) / 10.0;
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.activate),
+            ), gain);
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.explosion),
+            ), gain);
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.woosh),
+            ), gain);
+        }
+        {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[3])) / 10.0;
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.engine_idle),
+            ), gain);
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.engine_x),
+            ), gain);
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.samples, static.asset.sample.engine_y),
+            ), gain);
+        }
+        {
+            const gain: f32 = @as(f32, @floatFromInt(state.game.ui.settings[4])) / 10.0;
+            for (static.asset.music.levels) |path| {
+                try updateGain(self.audio.tracks.get(
+                    try state.assets.assetPath(.music, path),
+                ), gain);
+            }
+            try updateGain(self.audio.tracks.get(
+                try state.assets.assetPath(.music, static.asset.music.menu),
+            ), gain);
+        }
+    }
+    while (state.game.sample_queue.pop()) |cmd| {
+        switch (cmd) {
+            .start => |path| try self.audio.tracks.get(
+                try state.assets.assetPath(.samples, path),
+            ).play(),
+            .stop => |path| try self.audio.tracks.get(
+                try state.assets.assetPath(.samples, path),
+            ).stop(),
+        }
+    }
+    while (state.game.music_queue.pop()) |new_path| {
+        if (state.active_music) |path| {
+            try self.audio.tracks.get(path).stop();
+        }
+        if (new_path) |path| {
+            state.active_music = try state.assets.assetPath(.music, path);
+            try self.audio.tracks.get(state.active_music.?).play();
+        }
+    }
+    {
+        errdefer gfx_loader.cancel();
+        const gpa = gfx_loader.renderer.allocator;
+
+        const frame_buffer = try gfx_loader.renderer.getOrCreateStorageBuffer("frame_buffer");
+        frame_buffer.clearCPUBuffers();
+        const frame = state.frame;
+        for (0..game_render.cells[1]) |y| {
+            for (0..game_render.cells[0]) |x| {
+                const offset = y * game_render.cells[0] + x;
+                const attrs = frame.attrs[offset];
+                const bg = static.clr.rgb_f32[attrs.bg];
+                const fg = static.clr.rgb_f32[attrs.fg];
+                try frame_buffer.append(gpa, .vertex, [2]math.Vector4, 0, &.{
+                    .{ bg[0], bg[1], bg[2], @floatFromInt(frame.syms[offset]) },
+                    .{ fg[0], fg[1], fg[2], 0 },
+                });
+            }
+        }
+        try gfx_loader.flagModified(.storage_buffer, "frame_buffer");
+
+        if (gfx_fence.isValid()) {
+            try self.renderer.gpu_device.wait(.any, &.{gfx_fence});
+            self.renderer.gpu_device.release(&gfx_fence);
+        }
+        gfx_fence = try gfx_loader.commit();
+    }
+    return true;
+}
+
+fn updateGain(track: zengine.audio.Track, gain: f32) !void {
+    if (track.gain() != gain) try track.setGain(gain);
+}
+
+fn updateSettings(settings: []const u32) !void {
+    const file = try std.Io.Dir.createFileAbsolute(
+        global.io(),
+        settings_path,
+        .{ .lock = .exclusive },
+    );
+    defer file.close(global.io());
+    var out_buf: [256]u8 = undefined;
+    var writer = file.writer(global.io(), &out_buf);
+    const w = &writer.interface;
+    try w.writeInt(usize, settings.len, .little);
+    for (settings) |setting| try w.writeInt(u32, setting, .little);
+    try w.flush();
+}
+
+fn readSettings(settings: []u32) !void {
+    settings_path = try global.prefPath("settings.bin");
+    const file = std.Io.Dir.openFileAbsolute(
+        global.io(),
+        settings_path,
+        .{ .lock = .shared },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close(global.io());
+    var out_buf: [256]u8 = undefined;
+    var reader = file.reader(global.io(), &out_buf);
+    const r = &reader.interface;
+    const len = r.takeInt(usize, .little) catch return;
+    if (len != settings.len) return;
+    for (settings) |*setting| setting.* = try r.takeInt(u32, .little);
+}
+
+fn render(self: *const Zengine) !void {
+    self.ui.beginDraw();
+    self.ui.drawMainMenuBar(.{
+        .allocs_open = &allocs_window.is_open,
+        .perf_open = &perf_window.is_open,
+        .log_open = &log_window.is_open,
+    });
+    self.ui.drawDock();
+
+    self.ui.draw(allocs_window.element(), &allocs_window.is_open);
+    self.ui.draw(perf_window.element(), &perf_window.is_open);
+    self.ui.draw(log_window.element(), &log_window.is_open);
+
+    self.ui.endDraw();
+
+    _ = try game_render.renderScreen(self.renderer, self.ui, .init(.{
+        .scale = gfx_passes.scale.interface(),
+        .postfx = gfx_passes.postfx.interface(),
+        .letterbox = gfx_passes.letterbox.interface(),
+        .render = gfx_passes.render.interface(),
+    }), &gfx_fence);
+}

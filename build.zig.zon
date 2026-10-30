@@ -1,0 +1,14 @@
+.{
+    .name = .arch,
+    .version = "0.0.0",
+    .fingerprint = 0xf812224a60fd630a,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .zengine = .{ .path = "../zengine" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

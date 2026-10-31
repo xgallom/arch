@@ -1,9 +1,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const int = @import("int.zig");
+const zengine = @import("zengine");
+const int = zengine.math.int;
 
 const log = std.log.scoped(.prng);
+
 pub const Batch = struct {
     prng: int.Xoshiro128SSV,
 

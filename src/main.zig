@@ -56,7 +56,6 @@ pub const std_options: std.Options = .{
         .{ .scope = .core, .level = .info },
         .{ .scope = .cp437, .level = .info },
         .{ .scope = .game, .level = .info },
-        .{ .scope = .int, .level = .info },
         .{ .scope = .main, .level = .info },
         .{ .scope = .platform, .level = .info },
         .{ .scope = .param, .level = .info },
@@ -111,18 +110,14 @@ const WorkerCtx = struct {
 
 const State = struct {
     assets: Assets,
-    // game: core.state.GameState,
-    // frame: core.state.Frame,
     run_counter: RunCounter = .init(1),
     rnd: std.Random.DefaultPrng,
     active_music: ?[]const u8 = null,
     input_idx: usize = 0,
 
-    fn init(win_size: core.game.Point.U) !@This() {
+    fn init() !@This() {
         return .{
             .assets = try .init(allocators.global()),
-            .game = try .init(allocators.gpa(), win_size),
-            .frame = try .init(allocators.gpa(), win_size),
             .rnd = .init(0),
         };
     }
